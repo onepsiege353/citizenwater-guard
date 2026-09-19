@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
+const csvStringify = require('csv-stringify/sync');
 
 const app = express();
 app.use(cors());
@@ -15,7 +16,7 @@ const pool = new Pool({
 });
 
 // ---------------------------------------------------
-// Middleware to verify JWT (optional, for protected routes)
+// Middleware to verify JWT and attach role
 // ---------------------------------------------------
 function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -25,7 +26,7 @@ function authMiddleware(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET || 'super-secret');
-    req.user = payload; // { userId: ... }
+    req.user = payload; // { userId, role }
     next();
   } catch (err) {
     return res.status(403).json({ error: 'Token invalide' });
@@ -46,13 +47,17 @@ app.post('/api/auth/register', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone required' });
   try {
+    // Assign role 'citizen' by default; admin phone can be added later
+    const role = phone === 'admin@onep.ci' ? 'admin' : 'citizen';
     const result = await pool.query(
-      `INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING RETURNING id, phone, created_at`,
-      [phone]
+      `INSERT INTO users (phone, role) VALUES ($1, $2) ON CONFLICT (phone) DO NOTHING RETURNING id, phone, role, created_at`,
+      [phone, role]
     );
     if (result.rows.length === 0) {
-      // user already exists
-      const already = await pool.query(`SELECT id, phone, created_at FROM users WHERE phone = $1`, [phone]);
+      const already = await pool.query(
+        `SELECT id, phone, role, created_at FROM users WHERE phone = $1`,
+        [phone]
+      );
       return res.json({ user: already.rows[0], message: 'Utilisateur existant' });
     }
     res.json({ user: result.rows[0], message: 'Compte créé' });
@@ -64,12 +69,27 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   const { phone } = req.body;
-  const user = await pool.query(`SELECT id, phone FROM users WHERE phone = $1`, [phone]);
+  const user = await pool.query(`SELECT id, phone, role FROM users WHERE phone = $1`, [phone]);
   if (user.rows.length === 0) return res.status(404).json({ error: 'Utilisateur inconnu' });
-  // Issue a simple JWT (no real secret rotation for demo)
-  const token = jwt.sign({ userId: user.rows[0].id }, process.env.JWT_SECRET || 'super-secret', { expiresIn: '24h' });
+  const token = jwt.sign(
+    { userId: user.rows[0].id, role: user.rows[0].role },
+    process.env.JWT_SECRET || 'super-secret',
+    { expiresIn: '24h' }
+  );
   res.json({ token, user: user.rows[0] });
 });
+
+// ---------------------------------------------------
+// Roles helper (middleware)
+// ---------------------------------------------------
+function requireRole(...allowed) {
+  return (req, res, next) => {
+    if (!req.user || !allowed.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Accès non autorisé' });
+    }
+    next();
+  };
+}
 
 // ---------------------------------------------------
 // Signalements (reports) — CREATE
@@ -128,6 +148,15 @@ app.get('/api/signalements', authMiddleware, async (req, res) => {
     params.push(status);
     idx++;
   }
+  // Optional: near search (if lat/lon provided) – use ST_DWithin
+  if (req.user && req.user.role === 'inspector') {
+    const { lat, lon, radius = 5000 } = req.query;
+    if (lat && lon) {
+      query += ` AND ST_DWithin(location, ST_SetSRID(ST_MakePoint($${idx}, $${idx+1}), 4326)::geography, $${idx+2}::double precision)`;
+      params.push(parseFloat(lon), parseFloat(lat), radius / 1000); // radius in km
+      idx += 3;
+    }
+  }
   query += ` ORDER BY created_at DESC`;
   try {
     const result = await pool.query(query, params);
@@ -139,15 +168,46 @@ app.get('/api/signalements', authMiddleware, async (req, res) => {
 });
 
 // ---------------------------------------------------
-// Update status of a signalement (e.g., inspector resolves)
+// Bulk update status (admin only)
 // ---------------------------------------------------
-app.patch('/api/signalements/:id', authMiddleware, async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body; // 'valide', 'resolu', etc.
-  if (!status) return res.status(400).json({ error: 'status required' });
+app.patch('/api/signalements/bulk-status', authMiddleware, requireRole('admin'), async (req, res) => {
+  const { ids, status } = req.body;
+  if (!Array.isArray(ids) || !status) {
+    return res.status(400).json({ error: 'ids array and status required' });
+  }
+  const placeholders = ids.map((_, i) => `$${i + 1}`).join(',');
   try {
-    await pool.query(`UPDATE signalements SET status = $1 WHERE id = $2`, [status, id]);
-    res.json({ id, status });
+    await pool.query(
+      `UPDATE signalements SET status = $${ids.length + 1} WHERE id IN (${placeholders})`,
+      [...ids, status]
+    );
+    res.json({ message: `${ids.length} signalements mis à jour vers "${status}"` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ---------------------------------------------------
+// Nearby search (inspectors)
+// ---------------------------------------------------
+app.get('/api/signalements/near', authMiddleware, requireRole('inspector'), async (req, res) => {
+  const { lat, lon, radius = 5 } = req.query; // radius in km
+  if (!lat || !lon) {
+    return res.status(400).json({ error: 'lat and lon required' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT id, type, description, ST_AsGeoJSON(location) AS geojson, photo_url, created_at, status
+       FROM signalements
+       WHERE ST_DWithin(
+                location,
+                ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                $3 * 1000
+              )`,
+      [parseFloat(lon), parseFloat(lat), parseFloat(radius)]
+    );
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Database error' });
@@ -157,7 +217,7 @@ app.patch('/api/signalements/:id', authMiddleware, async (req, res) => {
 // ---------------------------------------------------
 // Dashboard stats (for admin)
 // ---------------------------------------------------
-app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
+app.get('/api/dashboard/stats', authMiddleware, requireRole('admin'), async (req, res) => {
   try {
     const total = await pool.query(`SELECT COUNT(*) AS cnt FROM signalements`);
     const byType = await pool.query(
@@ -188,6 +248,44 @@ app.get('/api/users/me/points', authMiddleware, async (req, res) => {
       [userId]
     );
     res.json({ totalPoints: result.rows[0].total_gain });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ---------------------------------------------------
+// Export signalements as CSV (admin)
+// ---------------------------------------------------
+app.get('/api/signalements/export', authMiddleware, requireRole('admin'), async (req, res) => {
+  try {
+    const { type, start, end } = req.query;
+    let query = `SELECT id, type, description, ST_AsText(location) AS location_wkt, photo_url, created_at, status FROM signalements WHERE 1=1`;
+    const params = [];
+    let idx = 1;
+    if (type) {
+      query += ` AND type = $${idx}`;
+      params.push(type);
+      idx++;
+    }
+    if (start) {
+      query += ` AND created_at >= $${idx}`;
+      params.push(start);
+      idx++;
+    }
+    if (end) {
+      query += ` AND created_at <= $${idx}`;
+      params.push(end);
+      idx++;
+    }
+    query += ` ORDER BY created_at DESC`;
+    const result = await pool.query(query, params);
+    // Transform to CSV string
+    const fields = ['id', 'type', 'description', 'location_wkt', 'photo_url', 'created_at', 'status'];
+    const csv = csvStringify.stringify(result.rows, { header: true, fields });
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename=signalements.csv');
+    res.send(csv);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Database error' });

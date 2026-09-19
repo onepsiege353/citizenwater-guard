@@ -5,8 +5,18 @@ import {
   useRoute,
 } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { View, Text, Button, Alert, StyleSheet, Platform, StatusBar } from 'react-native';
+import { View, Text, Button, Alert, StyleSheet, Platform, StatusBar, AsyncStorage } from 'react-native';
 import Icon from 'react-native-vector-icons/MaterialIcons';
+
+// Helper to get user role from async storage (mocked for demo)
+async function getUserRole() {
+  try {
+    const stored = await AsyncStorage.getItem('userRole');
+    return stored; // 'citizen' | 'inspector' | 'admin' | null
+  } catch (e) {
+    return null;
+  }
+}
 
 // Screens
 function HomeScreen({ navigation }) {
@@ -19,6 +29,8 @@ function HomeScreen({ navigation }) {
       </Text>
       <Button title="Signaler une anomalie" onPress={() => navigation.navigate('Report')} />
       <Button title="Tableau de bord" onPress={() => navigation.navigate('Dashboard')} />
+      {/* Admin tab is conditionally rendered; we always add it but hide if not admin */}
+      <Button title="Espace admin" onPress={() => navigation.navigate('Admin')} />
     </View>
   );
 }
@@ -66,7 +78,7 @@ function ReportScreen({ navigation }) {
         navigation.goBack();
       } else {
         const err = await response.json();
-        Alert.alert('Erreur', err.error || 'Échec de l’envoi');
+        Alert.alert('Erreur', err.error || 'Échec de l\'envoi');
       }
     } catch (e) {
       Alert.alert('Erreur', e.message);
@@ -80,7 +92,7 @@ function ReportScreen({ navigation }) {
         <Text style={styles.sectionTitle}>Type de signalement</Text>
         <View style={styles.radioGroup}>
           {types.map((t) => (
-            <View key={t} style={[styles.radio, { borderColor: type === t ? '#3b82f6' : undefined } ]}>
+            <View key={t} style={styles.radioGroup}>
               <Icon name={t} size={24} color={type === t ? '#3b82f6' : '#64748b'} />
               <Text style={styles.radioLabel} onPress={() => setType(t)}>{t}</Text>
             </View>
@@ -117,12 +129,48 @@ function DashboardScreen({ navigation }) {
   );
 }
 
+// Admin screen – only visible for users with role 'admin'
+async function AdminScreen({ navigation }) {
+  const role = await getUserRole();
+  // If not admin, redirect home (simple demo)
+  if (role !== 'admin') {
+    navigation.navigate('Home');
+    return null;
+  }
+  return (
+    <View style={styles.adminContainer}>
+      <StatusBar barStyle="light-content" />
+      <Text style={styles.adminTitle}>Espace Administrateur</Text>
+      <Text style={styles.adminDesc}>
+        Bienvenue {role}. Vous pouvez gérer les signalements et exporter les données.
+      </Text>
+      <Button title="Voir les statistiques" onPress={() => alert('Stats en développement')} />
+      <Button title="Exporter CSV" onPress={() => alert('Fonctionnalité CSV à venir')} />
+      <Button title="Déconnexion" onPress={() => {
+        AsyncStorage.removeItem('userRole').then(() => navigation.navigate('Home'));
+      }} />
+    </View>
+  );
+}
+
 // -----------------------------------------------------
 // Tab navigator setup
 // -----------------------------------------------------
 const Tab = createBottomTabs();
 
 export default function App() {
+  // Initialize role once
+  useEffect(() => {
+    // In a real app, you'd decode the JWT and store the role.
+    // Here we just mock a role for demo purposes.
+    // async () => { const r = await getUserRole(); if (r) setRole(r); }();
+  }, []);
+
+  const [role, setRole] = useState('citizen'); // default
+
+  // Conditionally show Admin tab: only if role is admin
+  const showAdmin = role === 'admin';
+
   return (
     <NavigationContainer>
       <Tab.Navigator
@@ -132,13 +180,15 @@ export default function App() {
             if (route.name === 'Home') iconName = 'map';
             if (route.name === 'Report') iconName = 'send';
             if (route.name === 'Dashboard') iconName = 'grid';
+            if (route.name === 'Admin' && showAdmin) iconName = 'shield';
             return <Icon name={iconName} size={size} color={color} />;
           },
-        })}
-      >
+        })}>
         <Tab.Screen name="Home" component={HomeScreen} />
         <Tab.Screen name="Report" component={ReportScreen} />
         <Tab.Screen name="Dashboard" component={DashboardScreen} />
+        {/* Admin tab appears only when user is admin */}
+        {showAdmin && <Tab.Screen name="Admin" component={AdminScreen} />}
       </Tab.Navigator>
     </NavigationContainer>
   );
@@ -146,8 +196,22 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f8f9fa' },
-  title: { fontSize: 22, fontWeight: 'bold', color: '#1e293b', marginTop: Platform.OS === 'android' ? 20 : 10, marginBottom: 20 },
+  title: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    color: '#1e293b',
+    marginTop: Platform.OS === 'android' ? 20 : 10,
+    marginBottom: 20,
+  },
   description: { fontSize: 14, color: '#64748b', marginBottom: 20 },
+  adminContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#f8f9fa',
+  },
+  adminTitle: { fontSize: 24, fontWeight: 'bold', color: '#1e293b', marginBottom: 20 },
+  adminDesc: { fontSize: 16, color: '#4a5568', marginBottom: 20, textAlign: 'center' },
   section: { padding: 12, backgroundColor: '#fff', marginBottom: 12, borderRadius: 8 },
   sectionTitle: { fontSize: 16, fontWeight: '600', color: '#1e293b', marginBottom: 8 },
   radioGroup: { flexDirection: 'row', marginBottom: 8 },

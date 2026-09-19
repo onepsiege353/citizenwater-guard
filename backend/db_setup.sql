@@ -5,9 +5,11 @@
 CREATE EXTENSION IF NOT EXISTS postgis;
 
 -- Users table (simple, phone number as identifier)
+-- Role: 'citizen' default, 'inspector', 'admin'
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     phone VARCHAR(20) UNIQUE NOT NULL,
+    role VARCHAR(20) DEFAULT 'citizen' CHECK (role IN ('citizen','inspector','admin')),
     created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -43,3 +45,9 @@ INSERT INTO signalements (type, description, location, status) VALUES
     ('orpaillage', 'Activité d\'orpaillage suspecte', ST_SetSRID(ST_MakePoint(-4.02, 5.38), 4326), 'en_attente'),
     ('autre', 'Autre problème', ST_SetSRID(ST_MakePoint(-4.03, 5.39), 4326), 'en_attente')
 ON CONFLICT DO NOTHING;
+
+-- Insert default roles (optional, just for seeding)
+INSERT INTO users (phone, role) VALUES
+    ('admin@onep.ci', 'admin'),
+    ('inspecteur@onep.ci', 'inspector')
+ON CONFLICT (phone) DO NOTHING;
