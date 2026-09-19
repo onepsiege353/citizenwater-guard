@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
@@ -13,23 +14,84 @@ const pool = new Pool({
   ssl: process.env.SSL_ENABLED === 'true' ? { rejectUnauthorized: false } : false,
 });
 
+// ---------------------------------------------------
+// Middleware to verify JWT (optional, for protected routes)
+// ---------------------------------------------------
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Token manquant' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'super-secret');
+    req.user = payload; // { userId: ... }
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: 'Token invalide' });
+  }
+}
+
+// ---------------------------------------------------
 // Health check
+// ---------------------------------------------------
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Create a new signalement (report)
-app.post('/api/signalements', async (req, res) => {
-  const { type, description, lat, lon, photo_url, user_id } = req.body;
-  if (!type || !lat || !lon) {
-    return res.status(400).json({ error: 'type, lat, lon are required' });
-  }
+// ---------------------------------------------------
+// Auth: register or login with phone (simple)
+// ---------------------------------------------------
+app.post('/api/auth/register', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone required' });
   try {
     const result = await pool.query(
-      `INSERT INTO signalements (type, description, location, photo_url, user_id, created_at)
-       VALUES ($1,$2,$3,$4,$5, NOW())
-       RETURNING id, type, created_at`,
-      [type, description, `SRID=4326 POINT(${lon} ${lat})`, photo_url || null, user_id || null]
+      `INSERT INTO users (phone) VALUES ($1) ON CONFLICT (phone) DO NOTHING RETURNING id, phone, created_at`,
+      [phone]
+    );
+    if (result.rows.length === 0) {
+      // user already exists
+      const already = await pool.query(`SELECT id, phone, created_at FROM users WHERE phone = $1`, [phone]);
+      return res.json({ user: already.rows[0], message: 'Utilisateur existant' });
+    }
+    res.json({ user: result.rows[0], message: 'Compte créé' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erreur base de données' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { phone } = req.body;
+  const user = await pool.query(`SELECT id, phone FROM users WHERE phone = $1`, [phone]);
+  if (user.rows.length === 0) return res.status(404).json({ error: 'Utilisateur inconnu' });
+  // Issue a simple JWT (no real secret rotation for demo)
+  const token = jwt.sign({ userId: user.rows[0].id }, process.env.JWT_SECRET || 'super-secret', { expiresIn: '24h' });
+  res.json({ token, user: user.rows[0] });
+});
+
+// ---------------------------------------------------
+// Signalements (reports) — CREATE
+// ---------------------------------------------------
+app.post('/api/signalements', authMiddleware, async (req, res) => {
+  const { type, description, lat, lon, photo_url } = req.body;
+  const userId = req.user.userId;
+  if (!type || lat === undefined || lon === undefined) {
+    return res.status(400).json({ error: 'type, lat, lon are required' });
+  }
+  const geom = `SRID=4326 POINT(${lon} ${lat})`;
+  try {
+    const result = await pool.query(
+      `INSERT INTO signalements (type, description, location, photo_url, user_id, status)
+       VALUES ($1,$2,$3,$4,$5,'en_attente')
+       RETURNING id, type, description, ST_AsGeoJSON(location) AS geojson, photo_url, created_at, status`,
+      [type, description || null, geom, photo_url || null, userId]
+    );
+    // Award points for reporting (example 10 points)
+    await pool.query(
+      `INSERT INTO points_log (user_id, gain, reason) VALUES ($1, 10, 'signalement')`,
+      [userId]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -38,10 +100,12 @@ app.post('/api/signalements', async (req, res) => {
   }
 });
 
-// List signalements (optionally filtered by type or date)
-app.get('/api/signalements', async (req, res) => {
-  const { type, start, end } = req.query;
-  let query = `SELECT id, type, description, ST_AsGeoJSON(location) AS geojson, photo_url, created_at FROM signalements WHERE 1=1`;
+// ---------------------------------------------------
+// Signalements — LIST (with optional filters)
+// ---------------------------------------------------
+app.get('/api/signalements', authMiddleware, async (req, res) => {
+  const { type, start, end, status } = req.query;
+  let query = `SELECT id, type, description, ST_AsGeoJSON(location) AS geojson, photo_url, created_at, status FROM signalements WHERE 1=1`;
   const params = [];
   let idx = 1;
   if (type) {
@@ -59,10 +123,71 @@ app.get('/api/signalements', async (req, res) => {
     params.push(end);
     idx++;
   }
+  if (status) {
+    query += ` AND status = $${idx}`;
+    params.push(status);
+    idx++;
+  }
   query += ` ORDER BY created_at DESC`;
   try {
     const result = await pool.query(query, params);
     res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ---------------------------------------------------
+// Update status of a signalement (e.g., inspector resolves)
+// ---------------------------------------------------
+app.patch('/api/signalements/:id', authMiddleware, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body; // 'valide', 'resolu', etc.
+  if (!status) return res.status(400).json({ error: 'status required' });
+  try {
+    await pool.query(`UPDATE signalements SET status = $1 WHERE id = $2`, [status, id]);
+    res.json({ id, status });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ---------------------------------------------------
+// Dashboard stats (for admin)
+// ---------------------------------------------------
+app.get('/api/dashboard/stats', authMiddleware, async (req, res) => {
+  try {
+    const total = await pool.query(`SELECT COUNT(*) AS cnt FROM signalements`);
+    const byType = await pool.query(
+      `SELECT type, COUNT(*) AS cnt FROM signalements GROUP BY type ORDER BY cnt DESC`
+    );
+    const recent = await pool.query(
+      `SELECT created_at FROM signalements ORDER BY created_at DESC LIMIT 5`
+    );
+    res.json({
+      total: total.rows[0].cnt,
+      byType: byType.rows,
+      recent: recent.rows
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ---------------------------------------------------
+// Points summary for a user
+// ---------------------------------------------------
+app.get('/api/users/me/points', authMiddleware, async (req, res) => {
+  const userId = req.user.userId;
+  try {
+    const result = await pool.query(
+      `SELECT COALESCE(SUM(gain),0) AS total_gain FROM points_log WHERE user_id = $1`,
+      [userId]
+    );
+    res.json({ totalPoints: result.rows[0].total_gain });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Database error' });
