@@ -1,0 +1,30 @@
+{
+  "name": "citizenwater-guard-frontend",
+  "version": "1.0.0",
+  "expo": {
+    "name": "CitizenWater Guard",
+    "slug": "citizenwater-guard",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "citizenwater",
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndPermission": "grantWhenInUse",
+          "locationWhenInUsePermission": "Allow $(PRODUCT_NAME) to access your location while the app is in use?"
+        }
+      ]
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptiveForeground.png",
+        "backgroundImage": "./assets/adaptiveBackground.png"
+      }
+    }
+  }
+}
