@@ -22,6 +22,7 @@ async function getUserRole() {
 function HomeScreen({ navigation }) {
   return (
     <View style={styles.container}>
+      <Image source={require('../assets/logo-onep.png')} style={styles.logo} />
       <StatusBar barStyle="light-content" />
       <Text style={styles.title}>Accueil – CitizenWater Guard</Text>
       <Text style={styles.description}>
@@ -219,4 +220,5 @@ const styles = StyleSheet.create({
   radioLabel: { fontSize: 12, textAlign: 'center', marginTop: 2 },
   input: { height: 40, borderWidth: 1, borderRadius: 6, paddingHorizontal: 8, marginBottom: 8 },
   coords: { fontSize: 14, marginTop: 4, color: '#64748b' },
+  logo: { width: 40, height: 40, marginBottom: 10 },
 });
